@@ -1,4 +1,5 @@
 import hmac
+import json
 import math
 import os
 import re
@@ -8,11 +9,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Variáveis de ambiente
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "")
 
 APP_USER = os.getenv("APP_USER", "")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+
+# Variáveis do Actor Logado da Catho
+CATHO_ACTOR_ID = os.getenv("CATHO_ACTOR_ID", "")
+CATHO_COOKIES_JSON = os.getenv("CATHO_COOKIES_JSON", "[]")
 
 HEADERS_APOLLO = {
     "Cache-Control": "no-cache",
@@ -20,24 +26,21 @@ HEADERS_APOLLO = {
     "x-api-key": APOLLO_API_KEY,
 }
 
-# Prefixos de busca X-Ray focados EXCLUSIVAMENTE em diretórios de candidatos/currículos
 PLATFORM_SITES = {
     "linkedin": 'site:linkedin.com/in/',
-    "catho": 'site:catho.com.br/profissionais/',
+    "catho": '(site:catho.com.br "currículo" OR site:catho.com.br/profissionais/)',
     "infojobs": '(site:infojobs.com.br/cv/ OR site:infojobs.com.br/candidato/)',
     "indeed": 'site:br.indeed.com/r/',
-    "vagas": 'site:vagas.com.br/ "curriculo"',
-    "todas": '(site:linkedin.com/in/ OR site:catho.com.br/profissionais/ OR site:infojobs.com.br/cv/ OR site:br.indeed.com/r/)'
+    "vagas": 'site:vagas.com.br "curriculo"',
+    "todas": '(site:linkedin.com/in/ OR site:catho.com.br OR site:infojobs.com.br/cv/ OR site:br.indeed.com/r/)'
 }
 
-# Palavras-chave em URLs que indicam Vagas (usadas para descartar anúncios de empregos)
 JOB_URL_KEYWORDS = [
     "/vagas/", "/vaga/", "/vagas-de-emprego/", "/jobs/", "/job/",
     "/oportunidades/", "/trabalhe-conosco/", "/emprego/", "/oferta-de-trabalho/"
 ]
 
 def e_url_de_vaga(url):
-    """Retorna True se a URL for um anúncio de vaga de emprego em vez de candidato."""
     url_lower = url.lower()
     return any(keyword in url_lower for keyword in JOB_URL_KEYWORDS)
 
@@ -51,21 +54,18 @@ def formatar_localizacao_query(loc_raw):
     elif "-" in loc_limpa:
         partes = [p.strip() for p in loc_limpa.split("-") if p.strip()]
         return f'("{partes[0]}" OR "{loc_limpa}")'
-    
     return f'"{loc_limpa}"'
 
 def extrair_nome_e_cargo(titulo_google):
     if not titulo_google:
         return "Candidato", "Não informado"
     
-    # Remove sufixos de plataformas do título retornado pelo Google
     titulo_limpo = re.sub(
         r"\s*[\-\|–]\s*(LinkedIn|Catho|InfoJobs|Indeed|Vagas|Curriculo|Resumo).*$", 
         "", 
         str(titulo_google), 
         flags=re.IGNORECASE
     )
-    
     partes = re.split(r"\s*[\-\|–]\s*", titulo_limpo)
     
     nome = partes[0].strip() if len(partes) > 0 else "Candidato"
@@ -91,14 +91,12 @@ def enriquecer_contato_apollo(linkedin_url):
             if isinstance(data, dict):
                 person = data.get("person") or {}
                 email = person.get("email") or "Não disponível"
-                
                 telefone = "Não disponível"
                 phones = person.get("phone_numbers") or []
                 if isinstance(phones, list) and len(phones) > 0 and isinstance(phones[0], dict):
                     telefone = phones[0].get("sanitized_number") or phones[0].get("raw_number") or "Não disponível"
                 elif person.get("sanitized_phone_number"):
                     telefone = person.get("sanitized_phone_number")
-                    
                 return email, telefone
     except Exception:
         pass
@@ -109,19 +107,58 @@ def buscar_candidatos_apify(cargos_raw, localizacao, plataforma="linkedin", limi
     if not APIFY_TOKEN:
         return [], "Token do Apify ausente (APIFY_TOKEN). Verifique as variáveis de ambiente!"
 
+    plataforma_clean = plataforma.lower()
+
+    # =========================================================
+    # 1. BUSCA VIA ACTOR CUSTOMIZADO LOGADO (CATHO CONTA PAGA)
+    # =========================================================
+    if plataforma_clean == "catho":
+        if not CATHO_ACTOR_ID:
+            return [], "ID do Actor da Catho (CATHO_ACTOR_ID) não configurado nas variáveis de ambiente."
+        
+        try:
+            cookies = json.loads(CATHO_COOKIES_JSON)
+        except Exception:
+            return [], "Erro ao ler os cookies da Catho. Verifique a variável CATHO_COOKIES_JSON."
+
+        apify_url = f"https://api.apify.com/v2/acts/{CATHO_ACTOR_ID}/run-sync-get-dataset-items?token={APIFY_TOKEN}"
+        
+        payload = {
+            "cathoCookies": cookies,
+            "cargo": cargos_raw,
+            "localizacao": localizacao,
+            "limite": limite
+        }
+
+        try:
+            res = requests.post(apify_url, json=payload, timeout=120)
+            if res.status_code not in (200, 201):
+                return [], f"Erro ao rodar Scraper da Catho (HTTP {res.status_code}): {res.text[:150]}"
+
+            dataset = res.json()
+            if not isinstance(dataset, list):
+                return [], "Catho Scraper não retornou dados válidos."
+
+            return dataset, None
+        except requests.exceptions.Timeout:
+            return [], "Tempo limite esgotado ao pesquisar na Catho."
+        except Exception as e:
+            return [], f"Erro na integração com a Catho: {str(e)}"
+
+    # =========================================================
+    # 2. BUSCA VIA GOOGLE SEARCH SCRAPER (LINKEDIN, INFOJOBS, ETC)
+    # =========================================================
     cargos_lista = [c.strip() for c in cargos_raw.split(",") if c.strip()]
     if not cargos_lista:
         return [], "Por favor, informe ao menos um cargo."
 
     loc_query = formatar_localizacao_query(localizacao)
-    site_prefix = PLATFORM_SITES.get(plataforma.lower(), PLATFORM_SITES["linkedin"])
+    site_prefix = PLATFORM_SITES.get(plataforma_clean, PLATFORM_SITES["linkedin"])
     
-    # Constrói queries no Google focando apenas em candidatos
     queries_lista = [f'{site_prefix} "{cargo}" {loc_query}' for cargo in cargos_lista]
     query_final_str = "\n".join(queries_lista)
     
     max_paginas = min(10, max(1, math.ceil(limite / 10)))
-
     apify_url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
     
     payload = {
@@ -132,7 +169,6 @@ def buscar_candidatos_apify(cargos_raw, localizacao, plataforma="linkedin", limi
 
     try:
         res = requests.post(apify_url, json=payload, timeout=60)
-        
         if res.status_code not in (200, 201):
             return [], f"Apify retornou erro HTTP {res.status_code}: {res.text[:150]}"
 
@@ -157,7 +193,6 @@ def buscar_candidatos_apify(cargos_raw, localizacao, plataforma="linkedin", limi
                     continue
                 url_perfil = item.get("url", "")
                 
-                # Ignora duplicados e descarta se for página de vaga
                 if not url_perfil or url_perfil in urls_vistas or e_url_de_vaga(url_perfil):
                     continue
 
@@ -168,22 +203,17 @@ def buscar_candidatos_apify(cargos_raw, localizacao, plataforma="linkedin", limi
                 nome, cargo_extraido = extrair_nome_e_cargo(titulo_item)
                 cargo_final = cargo_extraido if cargo_extraido != "Não informado" else cargos_lista[0]
 
-                # Se for LinkedIn, enriquece via Apollo API
                 if "linkedin.com/in/" in url_perfil:
                     email, telefone = enriquecer_contato_apollo(url_perfil)
                 else:
-                    # Para Catho/InfoJobs/Indeed, extrai contatos expostos no snippet público
                     email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', snippet)
                     phone_match = re.search(r'\(?\d{2}\)?\s?\d{4,5}[-\s]?\d{4}', snippet)
                     
-                    email = email_match.group(0) if email_match else "Acessar via Conta Paga"
-                    telefone = phone_match.group(0) if phone_match else "Acessar via Conta Paga"
+                    email = email_match.group(0) if email_match else "Ver no Portal"
+                    telefone = phone_match.group(0) if phone_match else "Ver no Portal"
 
-                # Identifica a plataforma de origem do perfil
                 origem = "LinkedIn"
-                if "catho.com.br" in url_perfil:
-                    origem = "Catho"
-                elif "infojobs.com.br" in url_perfil:
+                if "infojobs.com.br" in url_perfil:
                     origem = "InfoJobs"
                 elif "indeed.com" in url_perfil:
                     origem = "Indeed"
@@ -217,7 +247,7 @@ def buscar_candidatos_apify(cargos_raw, localizacao, plataforma="linkedin", limi
         return [], f"Erro ao processar busca: {str(e)}"
 
 
-# --- APLICAÇÃO FLASK ---
+# --- SERVIDOR FLASK ---
 app = Flask(__name__)
 
 @app.errorhandler(Exception)
@@ -264,7 +294,7 @@ HTML_TEMPLATE = """
                 <h1 class="text-2xl font-bold text-amber-500 flex items-center gap-2">
                     <i class="fa-solid fa-user-gear"></i> Busca de Candidatos
                 </h1>
-                <p class="text-sm text-gray-400 mt-1">Pesquisa direcionada a bancos de currículos (LinkedIn, Catho, InfoJobs, Indeed, Vagas).</p>
+                <p class="text-sm text-gray-400 mt-1">Pesquisa em tempo real (LinkedIn, Catho Conta Paga, InfoJobs, Indeed, Vagas).</p>
             </div>
         </div>
 
@@ -274,7 +304,7 @@ HTML_TEMPLATE = """
                     <label class="block text-sm font-medium text-gray-300 mb-1">Plataforma Alvo:</label>
                     <select id="plataformaInput" class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
                         <option value="linkedin">LinkedIn</option>
-                        <option value="catho">Catho</option>
+                        <option value="catho">Catho (Conta Paga)</option>
                         <option value="infojobs">InfoJobs</option>
                         <option value="indeed">Indeed</option>
                         <option value="vagas">Vagas.com</option>
@@ -283,7 +313,7 @@ HTML_TEMPLATE = """
                 </div>
                 <div>
                     <label class="block text-sm font-medium text-gray-300 mb-1">Cargo(s) Desejado(s):</label>
-                    <input type="text" id="cargoInput" placeholder="Ex: Desenvolvedor Python, Tech Lead" 
+                    <input type="text" id="cargoInput" placeholder="Ex: Desenvolvedor Python, Recrutador" 
                         class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
                 </div>
                 <div>
@@ -296,7 +326,7 @@ HTML_TEMPLATE = """
             <div class="flex items-center justify-between pt-2">
                 <div>
                     <label class="block text-sm font-medium text-gray-300 mb-1">Qtd. Máxima de Candidatos:</label>
-                    <input type="number" id="limiteInput" value="20" min="1" max="100" class="w-32 bg-gray-900 border border-gray-700 rounded-lg p-2 text-gray-100 focus:outline-none focus:border-amber-500 transition font-mono text-sm">
+                    <input type="number" id="limiteInput" value="10" min="1" max="100" class="w-32 bg-gray-900 border border-gray-700 rounded-lg p-2 text-gray-100 focus:outline-none focus:border-amber-500 transition font-mono text-sm">
                 </div>
                 <button id="btnProcessar" onclick="processarHunting()" 
                     class="bg-amber-500 hover:bg-amber-600 text-gray-950 font-bold py-3 px-8 rounded-lg transition flex items-center gap-2 shadow-lg shadow-amber-500/20">
@@ -307,7 +337,7 @@ HTML_TEMPLATE = """
 
         <div id="loading" class="hidden my-8 text-center">
             <div class="inline-block animate-spin rounded-full h-10 w-10 border-4 border-amber-500 border-t-transparent"></div>
-            <p class="text-gray-400 text-sm mt-3 animate-pulse">Varrendo bancos de currículos e cruzando telefones/e-mails...</p>
+            <p class="text-gray-400 text-sm mt-3 animate-pulse">A aceder à plataforma e a extrair contactos...</p>
         </div>
 
         <div id="resultadoContainer" class="hidden mt-8 border-t border-gray-700 pt-6">
@@ -327,7 +357,7 @@ HTML_TEMPLATE = """
             const plataforma = document.getElementById('plataformaInput').value;
             const cargo = document.getElementById('cargoInput').value.trim();
             const localizacao = document.getElementById('localizacaoInput').value.trim();
-            const limite = parseInt(document.getElementById('limiteInput').value) || 20;
+            const limite = parseInt(document.getElementById('limiteInput').value) || 10;
             
             if (!cargo) return alert('Por favor, informe ao menos um cargo.');
 
@@ -380,7 +410,7 @@ HTML_TEMPLATE = """
                                 <tr class="hover:bg-gray-800 transition">
                                     <td class="p-3 font-semibold text-gray-100">${c.nome}</td>
                                     <td class="p-3 text-gray-300">${c.cargo}</td>
-                                    <td class="p-3 text-xs font-mono text-amber-400/80">${c.plataforma}</td>
+                                    <td class="p-3 text-xs font-mono text-amber-400/80">${c.plataforma || 'Catho'}</td>
                                     <td class="p-3 font-mono text-xs text-amber-300/90">${c.email}</td>
                                     <td class="p-3 font-mono text-xs text-emerald-400">${c.telefone}</td>
                                     <td class="p-3 text-center">
@@ -423,9 +453,9 @@ def api_buscar_candidatos():
     localizacao = data.get("localizacao", "").strip()
     
     try:
-        limite = max(1, min(int(data.get("limite", 20)), 100))
+        limite = max(1, min(int(data.get("limite", 10)), 100))
     except (TypeError, ValueError):
-        limite = 20
+        limite = 10
 
     if not cargo:
         return jsonify({"status": "error", "message": "O campo 'cargo' é obrigatório."}), 400
@@ -443,6 +473,4 @@ def api_buscar_candidatos():
 
 if __name__ == "__main__":
     porta = int(os.getenv("PORT", "5000"))
-    print("\n--- SERVIDOR LOCAL START RH INICIADO ---")
-    print(f"Acesse no navegador: http://localhost:{porta}\n")
     app.run(host="127.0.0.1", port=porta, debug=False)
