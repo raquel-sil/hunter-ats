@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import hmac
 import json
 import math
@@ -105,12 +106,12 @@ def enriquecer_contato_apollo(linkedin_url):
 
 def _buscar_catho(cargos_raw, localizacao, limite):
     if not CATHO_ACTOR_ID:
-        return [], "ID do Actor da Catho (CATHO_ACTOR_ID) não configurado."
+        return [], "ID do Actor da Catho (CATHO_ACTOR_ID) não configurado nas variáveis de ambiente."
     
     try:
         cookies = json.loads(CATHO_COOKIES_JSON) if isinstance(CATHO_COOKIES_JSON, str) else CATHO_COOKIES_JSON
     except Exception:
-        return [], "Erro ao ler os cookies da Catho. Verifique a sintaxe da variável CATHO_COOKIES_JSON."
+        return [], "Erro de sintaxe JSON na variável CATHO_COOKIES_JSON."
 
     actor_id_clean = CATHO_ACTOR_ID.replace("/", "~").strip()
     apify_url = f"https://api.apify.com/v2/acts/{actor_id_clean}/run-sync-get-dataset-items?token={APIFY_TOKEN}"
@@ -127,14 +128,14 @@ def _buscar_catho(cargos_raw, localizacao, limite):
     }
 
     try:
-        # Timeout reduzido para 25s para evitar estouro de tempo limite (504) no Render
-        res = requests.post(apify_url, json=payload, timeout=25)
+        # Timeout expandido para 85 segundos para permitir a execução completa do navegador Puppeteer no Apify
+        res = requests.post(apify_url, json=payload, timeout=85)
         if res.status_code not in (200, 201):
             return [], f"Erro no Scraper da Catho (HTTP {res.status_code}): {res.text[:150]}"
 
         dataset = res.json()
         if not isinstance(dataset, list):
-            return [], "Catho Scraper não retornou dados válidos."
+            return [], "Catho Scraper não retornou uma lista de resultados válida."
 
         candidatos_normalizados = []
         for item in dataset:
@@ -161,7 +162,7 @@ def _buscar_catho(cargos_raw, localizacao, limite):
         return candidatos_normalizados[:limite], None
 
     except requests.exceptions.Timeout:
-        return [], "Tempo limite esgotado ao pesquisar na Catho."
+        return [], "A busca na Catho demorou mais de 85 segundos no Apify."
     except Exception as e:
         return [], f"Erro na integração com a Catho: {str(e)}"
 
@@ -186,7 +187,6 @@ def _buscar_google_xray(cargos_raw, localizacao, plataforma="linkedin", limite=2
     }
 
     try:
-        # Timeout reduzido para 25s para evitar estouro de tempo limite (504) no Render
         res = requests.post(apify_url, json=payload, timeout=25)
         if res.status_code not in (200, 201):
             return [], f"Apify retornou erro HTTP {res.status_code}: {res.text[:150]}"
@@ -271,21 +271,19 @@ def buscar_candidatos_apify(cargos_raw, localizacao, plataforma="linkedin", limi
     plataforma_clean = plataforma.lower()
 
     if plataforma_clean == "catho":
-        candidatos, erro = _buscar_catho(cargos_raw, localizacao, limite)
-        if not candidatos:
-            candidatos_xray, erro_xray = _buscar_google_xray(cargos_raw, localizacao, "catho", limite)
-            if candidatos_xray:
-                return candidatos_xray, None
-        return candidatos, erro
+        # Executa a busca da Catho diretamente sem encadear fallback para evitar estouro de tempo
+        return _buscar_catho(cargos_raw, localizacao, limite)
 
     elif plataforma_clean == "ambos":
         limite_por_lado = math.ceil(limite / 2)
-        candidatos_catho, erro_catho = _buscar_catho(cargos_raw, localizacao, limite_por_lado)
         
-        if not candidatos_catho:
-            candidatos_catho, _ = _buscar_google_xray(cargos_raw, localizacao, "catho", limite_por_lado)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_catho = executor.submit(_buscar_catho, cargos_raw, localizacao, limite_por_lado)
+            future_linkedin = executor.submit(_buscar_google_xray, cargos_raw, localizacao, "linkedin", limite_por_lado)
             
-        candidatos_linkedin, erro_linkedin = _buscar_google_xray(cargos_raw, localizacao, "linkedin", limite_por_lado)
+            candidatos_catho, erro_catho = future_catho.result()
+            candidatos_linkedin, erro_linkedin = future_linkedin.result()
+
         combinados = candidatos_catho + candidatos_linkedin
         erros = [e for e in [erro_catho, erro_linkedin] if e]
         erro_final = " | ".join(erros) if erros else None
@@ -428,13 +426,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     body: JSON.stringify({ plataforma, cargo, localizacao, limite })
                 });
 
-                // Valida se o servidor respondeu JSON ou HTML de erro (ex: 504 Timeout)
                 const contentType = response.headers.get("content-type");
                 if (!contentType || !contentType.includes("application/json")) {
                     if (response.status === 504) {
-                        throw new Error("A busca excedeu o tempo limite de 30s do Render. Tente buscar um número menor de candidatos.");
+                        throw new Error("A busca excedeu o tempo limite do servidor Render. Verifique se a flag --timeout 120 foi configurada no Start Command.");
                     }
-                    throw new Error(`Erro no servidor (HTTP ${response.status}). Verifique os logs no Render.`);
+                    throw new Error(`Erro do servidor (HTTP ${response.status}). Verifique as variáveis de ambiente da Catho no Render.`);
                 }
 
                 const data = await response.json();
