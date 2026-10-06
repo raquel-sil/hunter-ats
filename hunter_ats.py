@@ -110,7 +110,7 @@ def _buscar_catho(cargos_raw, localizacao, limite):
     try:
         cookies = json.loads(CATHO_COOKIES_JSON) if isinstance(CATHO_COOKIES_JSON, str) else CATHO_COOKIES_JSON
     except Exception:
-        return [], "Erro ao ler os cookies da Catho. Verifique a sintaxe da variável CATHO_COOKIES_JSON no .env."
+        return [], "Erro ao ler os cookies da Catho. Verifique a sintaxe da variável CATHO_COOKIES_JSON."
 
     actor_id_clean = CATHO_ACTOR_ID.replace("/", "~").strip()
     apify_url = f"https://api.apify.com/v2/acts/{actor_id_clean}/run-sync-get-dataset-items?token={APIFY_TOKEN}"
@@ -127,7 +127,8 @@ def _buscar_catho(cargos_raw, localizacao, limite):
     }
 
     try:
-        res = requests.post(apify_url, json=payload, timeout=120)
+        # Timeout reduzido para 25s para evitar estouro de tempo limite (504) no Render
+        res = requests.post(apify_url, json=payload, timeout=25)
         if res.status_code not in (200, 201):
             return [], f"Erro no Scraper da Catho (HTTP {res.status_code}): {res.text[:150]}"
 
@@ -185,7 +186,8 @@ def _buscar_google_xray(cargos_raw, localizacao, plataforma="linkedin", limite=2
     }
 
     try:
-        res = requests.post(apify_url, json=payload, timeout=60)
+        # Timeout reduzido para 25s para evitar estouro de tempo limite (504) no Render
+        res = requests.post(apify_url, json=payload, timeout=25)
         if res.status_code not in (200, 201):
             return [], f"Apify retornou erro HTTP {res.status_code}: {res.text[:150]}"
 
@@ -425,6 +427,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ plataforma, cargo, localizacao, limite })
                 });
+
+                // Valida se o servidor respondeu JSON ou HTML de erro (ex: 504 Timeout)
+                const contentType = response.headers.get("content-type");
+                if (!contentType || !contentType.includes("application/json")) {
+                    if (response.status === 504) {
+                        throw new Error("A busca excedeu o tempo limite de 30s do Render. Tente buscar um número menor de candidatos.");
+                    }
+                    throw new Error(`Erro no servidor (HTTP ${response.status}). Verifique os logs no Render.`);
+                }
 
                 const data = await response.json();
                 loading.classList.add('hidden');
