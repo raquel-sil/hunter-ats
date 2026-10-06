@@ -114,7 +114,8 @@ def _buscar_catho(cargos_raw, localizacao, limite):
         return [], "Erro de sintaxe JSON na variável CATHO_COOKIES_JSON."
 
     actor_id_clean = CATHO_ACTOR_ID.replace("/", "~").strip()
-    apify_url = f"https://api.apify.com/v2/acts/{actor_id_clean}/run-sync-get-dataset-items?token={APIFY_TOKEN}"
+    # Adicionado timeout=20 na URL do Apify para forçar resposta antes da requisição estourar
+    apify_url = f"https://api.apify.com/v2/acts/{actor_id_clean}/run-sync-get-dataset-items?token={APIFY_TOKEN}&timeout=20"
     
     payload = {
         "cathoCookies": cookies,
@@ -128,8 +129,7 @@ def _buscar_catho(cargos_raw, localizacao, limite):
     }
 
     try:
-        # Timeout expandido para 85 segundos para permitir a execução completa do navegador Puppeteer no Apify
-        res = requests.post(apify_url, json=payload, timeout=85)
+        res = requests.post(apify_url, json=payload, timeout=25)
         if res.status_code not in (200, 201):
             return [], f"Erro no Scraper da Catho (HTTP {res.status_code}): {res.text[:150]}"
 
@@ -162,7 +162,7 @@ def _buscar_catho(cargos_raw, localizacao, limite):
         return candidatos_normalizados[:limite], None
 
     except requests.exceptions.Timeout:
-        return [], "A busca na Catho demorou mais de 85 segundos no Apify."
+        return [], "A busca na Catho atingiu o tempo limite do servidor Apify."
     except Exception as e:
         return [], f"Erro na integração com a Catho: {str(e)}"
 
@@ -178,7 +178,7 @@ def _buscar_google_xray(cargos_raw, localizacao, plataforma="linkedin", limite=2
     query_final_str = "\n".join(queries_lista)
     
     max_paginas = min(10, max(1, math.ceil(limite / 10)))
-    apify_url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
+    apify_url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}&timeout=20"
     
     payload = {
         "queries": query_final_str,
@@ -271,7 +271,6 @@ def buscar_candidatos_apify(cargos_raw, localizacao, plataforma="linkedin", limi
     plataforma_clean = plataforma.lower()
 
     if plataforma_clean == "catho":
-        # Executa a busca da Catho diretamente sem encadear fallback para evitar estouro de tempo
         return _buscar_catho(cargos_raw, localizacao, limite)
 
     elif plataforma_clean == "ambos":
