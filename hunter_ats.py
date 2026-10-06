@@ -108,17 +108,23 @@ def _buscar_catho(cargos_raw, localizacao, limite):
         return [], "ID do Actor da Catho (CATHO_ACTOR_ID) não configurado."
     
     try:
-        cookies = json.loads(CATHO_COOKIES_JSON)
+        cookies = json.loads(CATHO_COOKIES_JSON) if isinstance(CATHO_COOKIES_JSON, str) else CATHO_COOKIES_JSON
     except Exception:
-        return [], "Erro ao ler os cookies da Catho. Verifique a variável CATHO_COOKIES_JSON."
+        return [], "Erro ao ler os cookies da Catho. Verifique a sintaxe da variável CATHO_COOKIES_JSON no .env."
 
-    apify_url = f"https://api.apify.com/v2/acts/{CATHO_ACTOR_ID}/run-sync-get-dataset-items?token={APIFY_TOKEN}"
+    # Formata o Actor ID substituindo '/' por '~' exigido na API Apify
+    actor_id_clean = CATHO_ACTOR_ID.replace("/", "~").strip()
+    apify_url = f"https://api.apify.com/v2/acts/{actor_id_clean}/run-sync-get-dataset-items?token={APIFY_TOKEN}"
     
     payload = {
         "cathoCookies": cookies,
+        "cookies": cookies,  # Mantém compatibilidade caso o actor espere 'cookies'
         "cargo": cargos_raw,
+        "search": cargos_raw,
         "localizacao": localizacao,
-        "limite": limite
+        "location": localizacao,
+        "limite": limite,
+        "maxItems": limite
     }
 
     try:
@@ -130,7 +136,31 @@ def _buscar_catho(cargos_raw, localizacao, limite):
         if not isinstance(dataset, list):
             return [], "Catho Scraper não retornou dados válidos."
 
-        return dataset, None
+        # Padronização dos dados para o contrato esperado pelo frontend
+        candidatos_normalizados = []
+        for item in dataset:
+            if not isinstance(item, dict):
+                continue
+            
+            nome = item.get("nome") or item.get("name") or item.get("fullName") or "Candidato Catho"
+            cargo = item.get("cargo") or item.get("title") or item.get("jobTitle") or cargos_raw
+            email = item.get("email") or "Ver no Portal"
+            telefone = item.get("telefone") or item.get("phone") or item.get("celular") or "Ver no Portal"
+            link = item.get("link") or item.get("url") or item.get("profileUrl") or "https://www.catho.com.br"
+            loc = item.get("localizacao") or item.get("location") or localizacao or "Não informada"
+
+            candidatos_normalizados.append({
+                "nome": nome,
+                "cargo": cargo,
+                "localizacao": loc,
+                "email": email,
+                "telefone": telefone,
+                "link": link,
+                "plataforma": "Catho"
+            })
+
+        return candidatos_normalizados[:limite], None
+
     except requests.exceptions.Timeout:
         return [], "Tempo limite esgotado ao pesquisar na Catho."
     except Exception as e:
@@ -202,7 +232,9 @@ def _buscar_google_xray(cargos_raw, localizacao, plataforma="linkedin", limite=2
                     telefone = phone_match.group(0) if phone_match else "Ver no Portal"
 
                 origem = "LinkedIn"
-                if "infojobs.com.br" in url_perfil:
+                if "catho.com.br" in url_perfil:
+                    origem = "Catho (Google X-Ray)"
+                elif "infojobs.com.br" in url_perfil:
                     origem = "InfoJobs"
                 elif "indeed.com" in url_perfil:
                     origem = "Indeed"
@@ -239,10 +271,22 @@ def buscar_candidatos_apify(cargos_raw, localizacao, plataforma="linkedin", limi
     plataforma_clean = plataforma.lower()
 
     if plataforma_clean == "catho":
-        return _buscar_catho(cargos_raw, localizacao, limite)
+        candidatos, erro = _buscar_catho(cargos_raw, localizacao, limite)
+        # Fallback para Google X-Ray se o Actor da Catho não retornar resultados ou der erro
+        if not candidatos:
+            candidatos_xray, erro_xray = _buscar_google_xray(cargos_raw, localizacao, "catho", limite)
+            if candidatos_xray:
+                return candidatos_xray, None
+        return candidatos, erro
+
     elif plataforma_clean == "ambos":
         limite_por_lado = math.ceil(limite / 2)
         candidatos_catho, erro_catho = _buscar_catho(cargos_raw, localizacao, limite_por_lado)
+        
+        # Fallback para X-Ray da Catho caso o Actor venha vazio
+        if not candidatos_catho:
+            candidatos_catho, _ = _buscar_google_xray(cargos_raw, localizacao, "catho", limite_por_lado)
+            
         candidatos_linkedin, erro_linkedin = _buscar_google_xray(cargos_raw, localizacao, "linkedin", limite_por_lado)
         combinados = candidatos_catho + candidatos_linkedin
         erros = [e for e in [erro_catho, erro_linkedin] if e]
@@ -252,230 +296,3 @@ def buscar_candidatos_apify(cargos_raw, localizacao, plataforma="linkedin", limi
         return combinados[:limite], erro_final
     else:
         return _buscar_google_xray(cargos_raw, localizacao, plataforma_clean, limite)
-
-
-# --- SERVIDOR FLASK ---
-app = Flask(__name__)
-
-@app.errorhandler(Exception)
-def tratar_erro_generico(e):
-    code = getattr(e, "code", 500)
-    return jsonify({"status": "error", "message": f"Erro interno ({code}): {str(e)}"}), code
-
-def _pedir_login():
-    return Response(
-        "Acesso restrito.", 401, {"WWW-Authenticate": 'Basic realm="Start RH - Candidate Search"'}
-    )
-
-@app.before_request
-def exigir_login():
-    if not APP_USER or not APP_PASSWORD:
-        if request.path.startswith("/api/"):
-            return jsonify({"status": "error", "message": "APP_USER/APP_PASSWORD não configurados."}), 503
-        return Response("APP_USER/APP_PASSWORD não configurados.", 503)
-
-    auth = request.authorization
-    if not auth:
-        return _pedir_login()
-    user_ok = hmac.compare_digest(auth.username or "", APP_USER)
-    pass_ok = hmac.compare_digest(auth.password or "", APP_PASSWORD)
-    if not (user_ok and pass_ok):
-        return _pedir_login()
-
-
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Start RH - Busca de Candidatos</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-</head>
-<body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col items-center p-6">
-    <div class="max-w-6xl w-full bg-gray-800 rounded-xl shadow-2xl border border-gray-700 p-8 mt-6">
-        <div class="flex items-center justify-between border-b border-gray-700 pb-6 mb-6">
-            <div>
-                <h1 class="text-2xl font-bold text-amber-500 flex items-center gap-2">
-                    <i class="fa-solid fa-user-gear"></i> Busca de Candidatos
-                </h1>
-                <p class="text-sm text-gray-400 mt-1">Pesquisa em tempo real (LinkedIn, Catho Conta Paga, InfoJobs, Indeed, Vagas).</p>
-            </div>
-        </div>
-
-        <div class="space-y-4">
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                    <label class="block text-sm font-medium text-gray-300 mb-1">Plataforma Alvo:</label>
-                    <select id="plataformaInput" class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
-                        <option value="linkedin">LinkedIn</option>
-                        <option value="catho">Catho (Conta Paga)</option>
-                        <option value="ambos" selected>Ambos (LinkedIn + Catho)</option>
-                        <option value="infojobs">InfoJobs</option>
-                        <option value="indeed">Indeed</option>
-                        <option value="vagas">Vagas.com</option>
-                        <option value="todas">Todas as Plataformas</option>
-                    </select>
-                </div>
-                <div>
-                    <label class="block text-sm font-medium text-gray-300 mb-1">Cargo(s) Desejado(s):</label>
-                    <input type="text" id="cargoInput" placeholder="Ex: Desenvolvedor Python, Recrutador" 
-                        class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
-                </div>
-                <div>
-                    <label class="block text-sm font-medium text-gray-300 mb-1">Localização (Cidade/Estado):</label>
-                    <input type="text" id="localizacaoInput" value="São Paulo" placeholder="Ex: Campinas, SP" 
-                        class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
-                </div>
-            </div>
-
-            <div class="flex items-center justify-between pt-2">
-                <div>
-                    <label class="block text-sm font-medium text-gray-300 mb-1">Qtd. Máxima de Candidatos:</label>
-                    <input type="number" id="limiteInput" value="10" min="1" max="100" class="w-32 bg-gray-900 border border-gray-700 rounded-lg p-2 text-gray-100 focus:outline-none focus:border-amber-500 transition font-mono text-sm">
-                </div>
-                <button id="btnProcessar" onclick="processarHunting()" 
-                    class="bg-amber-500 hover:bg-amber-600 text-gray-950 font-bold py-3 px-8 rounded-lg transition flex items-center gap-2 shadow-lg shadow-amber-500/20">
-                    <i class="fa-solid fa-magnifying-glass"></i> Buscar Candidatos
-                </button>
-            </div>
-        </div>
-
-        <div id="loading" class="hidden my-8 text-center">
-            <div class="inline-block animate-spin rounded-full h-10 w-10 border-4 border-amber-500 border-t-transparent"></div>
-            <p class="text-gray-400 text-sm mt-3 animate-pulse">A aceder às plataformas e a extrair contactos...</p>
-        </div>
-
-        <div id="resultadoContainer" class="hidden mt-8 border-t border-gray-700 pt-6">
-            <div class="flex items-center justify-between mb-4">
-                <h2 class="text-lg font-semibold text-gray-200 flex items-center gap-2">
-                    <i class="fa-solid fa-users text-amber-500"></i> Perfis Encontrados:
-                </h2>
-                <span id="totalBadge" class="bg-amber-500/10 text-amber-400 text-xs px-3 py-1 rounded-full border border-amber-500/20 font-mono"></span>
-            </div>
-            
-            <div id="logList" class="space-y-3 font-sans text-sm"></div>
-        </div>
-    </div>
-
-    <script>
-        async function processarHunting() {
-            const plataforma = document.getElementById('plataformaInput').value;
-            const cargo = document.getElementById('cargoInput').value.trim();
-            const localizacao = document.getElementById('localizacaoInput').value.trim();
-            const limite = parseInt(document.getElementById('limiteInput').value) || 10;
-            
-            if (!cargo) return alert('Por favor, informe ao menos um cargo.');
-
-            const btn = document.getElementById('btnProcessar');
-            const loading = document.getElementById('loading');
-            const resultadoContainer = document.getElementById('resultadoContainer');
-            const logList = document.getElementById('logList');
-            const totalBadge = document.getElementById('totalBadge');
-
-            btn.disabled = true;
-            btn.classList.add('opacity-50', 'cursor-not-allowed');
-            loading.classList.remove('hidden');
-            resultadoContainer.classList.add('hidden');
-            logList.innerHTML = '';
-
-            try {
-                const response = await fetch('/api/buscar_candidatos', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ plataforma, cargo, localizacao, limite })
-                });
-
-                const data = await response.json();
-                loading.classList.add('hidden');
-                resultadoContainer.classList.remove('hidden');
-
-                if (response.ok && data.status === 'success') {
-                    totalBadge.innerText = `${data.contatos.length} Candidato(s)`;
-
-                    if (data.contatos.length === 0) {
-                        logList.innerHTML = `<p class="text-rose-400 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-triangle-exclamation"></i> <b>Aviso:</b> ${data.erro || 'Nenhum candidato encontrado.'}</p>`;
-                    } else {
-                        let tableHtml = `
-                            <div class="overflow-x-auto">
-                                <table class="w-full text-left border-collapse border border-gray-700">
-                                    <thead>
-                                        <tr class="bg-gray-900 text-amber-400 border-b border-gray-700 text-xs uppercase font-mono">
-                                            <th class="p-3">Nome</th>
-                                            <th class="p-3">Cargo</th>
-                                            <th class="p-3">Plataforma</th>
-                                            <th class="p-3">E-mail</th>
-                                            <th class="p-3">Telefone</th>
-                                            <th class="p-3 text-center">Ação</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody class="divide-y divide-gray-700 bg-gray-800/50">`;
-
-                        data.contatos.forEach(c => {
-                            tableHtml += `
-                                <tr class="hover:bg-gray-800 transition">
-                                    <td class="p-3 font-semibold text-gray-100">${c.nome}</td>
-                                    <td class="p-3 text-gray-300">${c.cargo}</td>
-                                    <td class="p-3 text-xs font-mono text-amber-400/80">${c.plataforma || 'Catho'}</td>
-                                    <td class="p-3 font-mono text-xs text-amber-300/90">${c.email}</td>
-                                    <td class="p-3 font-mono text-xs text-emerald-400">${c.telefone}</td>
-                                    <td class="p-3 text-center">
-                                        <a href="${c.link}" target="_blank" class="inline-flex items-center gap-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-500/30 px-3 py-1 rounded text-xs transition">
-                                            Ver Perfil <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
-                                        </a>
-                                    </td>
-                                </tr>`;
-                        });
-
-                        tableHtml += `</tbody></table></div>`;
-                        logList.innerHTML = tableHtml;
-                    }
-                } else {
-                    logList.innerHTML = `<p class="text-rose-500 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-bomb"></i> <b>Erro:</b> ${data.message || data.erro || 'Falha na requisição.'}</p>`;
-                }
-            } catch (err) {
-                loading.classList.add('hidden');
-                resultadoContainer.classList.remove('hidden');
-                logList.innerHTML = `<p class="text-rose-500 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-circle-exclamation"></i> ${err.message}</p>`;
-            } finally {
-                btn.disabled = false;
-                btn.classList.remove('opacity-50', 'cursor-not-allowed');
-            }
-        }
-    </script>
-</body>
-</html>"""
-
-@app.route("/")
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route("/api/buscar_candidatos", methods=["POST"])
-def api_buscar_candidatos():
-    data = request.json or {}
-    plataforma = data.get("plataforma", "ambos").lower()
-    cargo = data.get("cargo", "").strip()
-    localizacao = data.get("localizacao", "").strip()
-    
-    try:
-        limite = max(1, min(int(data.get("limite", 10)), 100))
-    except (TypeError, ValueError):
-        limite = 10
-
-    if not cargo:
-        return jsonify({"status": "error", "message": "O campo 'cargo' é obrigatório."}), 400
-
-    contatos, erro_apify = buscar_candidatos_apify(cargo, localizacao, plataforma=plataforma, limite=limite)
-    
-    return jsonify({
-        "status": "success",
-        "plataforma": plataforma,
-        "cargo": cargo,
-        "localizacao": localizacao,
-        "contatos": contatos,
-        "erro": erro_apify
-    })
-
-if __name__ == "__main__":
-    porta = int(os.getenv("PORT", "5000"))
-    app.run(host="127.0.0.1", port=porta, debug=False)
